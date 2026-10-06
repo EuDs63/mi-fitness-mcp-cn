@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from mi_fitness_mcp.models import BodyMeasurement, DailyActivity, HeartRateSample
+from mi_fitness_mcp.models import BodyMeasurement, DailyActivity, HeartRateSample, SleepSession
 from mi_fitness_mcp.services.query_service import QueryService
 from mi_fitness_mcp.storage import Database
 
@@ -45,3 +45,17 @@ def test_storage_and_query_roundtrip(tmp_path):
     assert len(query.get_daily_summaries("2025-04-01", "2025-04-01")) == 1
     assert len(query.get_heart_rate_samples("2025-04-01", "2025-04-01")) == 1
     assert len(query.get_body_measurements("2025-04-01", "2025-04-01")) == 1
+
+
+def test_sleep_queries_use_local_wake_up_date(tmp_path):
+    db = Database(tmp_path / "sleep.db")
+    db.insert_sleep_session(SleepSession(
+        id="sleep1", sleep_id="night1", provider="mi_fitness",
+        source_type="cloud_session", user_id="u1",
+        start_at=datetime.fromisoformat("2025-04-01T23:00:00+08:00"),
+        end_at=datetime.fromisoformat("2025-04-02T07:00:00+08:00"),
+        duration_minutes=480, time_asleep_minutes=450, time_awake_minutes=30,
+    ))
+    query = QueryService(db, "u1")
+    assert query.get_sleep_sessions("2025-04-01", "2025-04-01") == []
+    assert len(query.get_sleep_sessions("2025-04-02", "2025-04-02")) == 1

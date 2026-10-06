@@ -629,13 +629,13 @@ class Database:
         start_date: str,
         end_date: str,
     ) -> list[dict[str, Any]]:
-        """Query sleep session records."""
+        """Query sleep sessions by their local wake-up date, as in Mi Fitness."""
         with self._get_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM sleep_sessions
                 WHERE user_id = ?
-                AND substr(start_at, 1, 10) >= ? AND substr(start_at, 1, 10) <= ?
+                AND substr(end_at, 1, 10) >= ? AND substr(end_at, 1, 10) <= ?
                 ORDER BY start_at
                 """,
                 (user_id, start_date, end_date),

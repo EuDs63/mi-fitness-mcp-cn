@@ -340,6 +340,40 @@ class MiFitnessCloudAdapter(DataAdapter):
                     continue
         return preferred_region
 
+    async def _fetch_daily_goals(self, start_date: str, end_date: str) -> list[dict]:
+        """Fetch the cloud's merged daily totals, rather than summing device sources."""
+        base_url = (
+            "https://hlth.io.mi.com"
+            if self.region in ("", "cn")
+            else f"https://{self.region}.hlth.io.mi.com"
+        )
+        start_time, end_time = self._date_range_to_timestamps(start_date, end_date)
+        items: list[dict] = []
+        next_key = None
+        seen_keys: set[str] = set()
+        for _ in range(self.max_pages):
+            payload = {
+                "tag": "daily_fitness", "key": "goal",
+                "start_time": start_time, "end_time": end_time,
+            }
+            if next_key:
+                payload["next_key"] = next_key
+            result = await self._request(
+                base_url, "/app/v1/data/get_aggregated_fitness_data_by_time", payload
+            )
+            # Some cloud versions return records outside the requested window.
+            items.extend(
+                item for item in result.get("data_list", [])
+                if start_date <= self._record_datetime(item).date().isoformat() <= end_date
+            )
+            if not result.get("has_more") or not result.get("next_key"):
+                return items
+            next_key = str(result["next_key"])
+            if next_key in seen_keys:
+                raise RuntimeError("Mi Fitness daily goal pagination cursor loop detected")
+            seen_keys.add(next_key)
+        raise RuntimeError("Mi Fitness daily goal pagination exceeded safety limit")
+
     async def _discover_data_types(self) -> list[str]:
         # 小米健康云没有可靠的能力发现接口。旧实现用固定历史区间探测，
         # 当该区间无数据时会导致自动同步静默跳过大部分指标。
@@ -413,18 +447,32 @@ class MiFitnessCloudAdapter(DataAdapter):
 
         return items
 
-    def _sleep_stage_name(self, state: Any) -> str:
+    def _sleep_stage_name(self, state: Any) -> str | None:
         mapping = {
-            1: "deep",
-            2: "light",
+            2: "deep",
             3: "light",
-            4: "awake",
-            5: "rem",
+            4: "rem",
+            5: "awake",
         }
         try:
-            return mapping.get(int(state), "light")
-        except Exception:
-            return "light"
+            return mapping.get(int(state))
+        except (TypeError, ValueError):
+            return None
+
+    def _merge_activity_minutes(self, records: list[dict]) -> list[dict]:
+        """Keep one record per minute across overlapping devices and page boundaries."""
+        minutes: dict[int, tuple[tuple[float, float, int], dict]] = {}
+        for item in records:
+            minute = int(item.get("time", 0)) // 60
+            payload = self._parse_value(item)
+            rank = (
+                float(payload.get("steps", 0)), float(payload.get("calories", 0)),
+                int(item.get("update_time", 0) or 0),
+            )
+            previous = minutes.get(minute)
+            if previous is None or rank > previous[0]:
+                minutes[minute] = (rank, item)
+        return [value[1] for value in minutes.values()]
 
     def _optional_float(self, value: Any) -> float | None:
         if value is None:
@@ -447,7 +495,9 @@ class MiFitnessCloudAdapter(DataAdapter):
             return
             yield
 
-        records = await self._fetch_key("steps", start_date, end_date)
+        records = self._merge_activity_minutes(
+            await self._fetch_key("steps", start_date, end_date)
+        )
         daily: dict[str, dict[str, Any]] = defaultdict(
             lambda: {
                 "steps": 0,
@@ -471,7 +521,9 @@ class MiFitnessCloudAdapter(DataAdapter):
             ):
                 daily[date_str]["collected_at"] = collected_at
 
-        calorie_records = await self._fetch_key("calories", start_date, end_date)
+        calorie_records = self._merge_activity_minutes(
+            await self._fetch_key("calories", start_date, end_date)
+        )
         calorie_totals: dict[str, float] = defaultdict(float)
         for item in calorie_records:
             payload = self._parse_value(item)
@@ -488,6 +540,27 @@ class MiFitnessCloudAdapter(DataAdapter):
         for date_str, total in calorie_totals.items():
             daily[date_str]["active_kcal"] = total
 
+        # The App's goals already merge phone and wearable sources. Raw minute
+        # merging is only a fallback for dates/fields without a cloud daily total.
+        goals_by_date: dict[str, dict] = {}
+        for item in await self._fetch_daily_goals(start_date, end_date):
+            date_str = self._record_datetime(item).date().isoformat()
+            previous = goals_by_date.get(date_str)
+            if previous is None or int(item.get("update_time", 0) or 0) > int(
+                previous.get("update_time", 0) or 0
+            ):
+                goals_by_date[date_str] = item
+        fields = {1: "steps", 2: "active_kcal", 4: "active_minutes"}
+        for date_str, item in goals_by_date.items():
+            values = daily[date_str]
+            for goal in self._parse_value(item).get("goal_items", []) or []:
+                field = fields.get(goal.get("field"))
+                if field and goal.get("achieved_value") is not None:
+                    values[field] = goal["achieved_value"]
+            if values["collected_at"] is None:
+                values["collected_at"] = self._record_datetime(item)
+                values["timezone"] = item.get("zone_name") or "UTC"
+
         for date_str, values in sorted(daily.items()):
             yield DailyActivity(
                 id=f"mi_fitness_activity_{date_str}",
@@ -500,6 +573,7 @@ class MiFitnessCloudAdapter(DataAdapter):
                 steps=int(values["steps"]),
                 distance_m=float(values["distance_m"]),
                 active_kcal=float(values["active_kcal"]),
+                active_minutes=values.get("active_minutes"),
             )
 
     async def iter_sleep_sessions(
@@ -531,13 +605,7 @@ class MiFitnessCloudAdapter(DataAdapter):
 
             start_at = self._timestamp_to_datetime(sleep_start, zone_offset)
             end_at = self._timestamp_to_datetime(sleep_end, zone_offset)
-            duration_minutes = int(
-                payload.get("duration") or max(0, (int(sleep_end) - int(sleep_start)) // 60)
-            )
-            awake_minutes = int(
-                payload.get("awake_duration") or payload.get("sleep_awake_duration") or 0
-            )
-            asleep_minutes = max(0, duration_minutes - awake_minutes)
+            duration_minutes = max(0, int((end_at - start_at).total_seconds() // 60))
 
             stages: list[SleepStage] = []
             for segment in payload.get("items", []) or []:
@@ -545,14 +613,35 @@ class MiFitnessCloudAdapter(DataAdapter):
                     seg_start = int(segment.get("start_time", 0))
                     seg_end = int(segment.get("end_time", 0))
                     minutes = max(0, (seg_end - seg_start) // 60)
-                    if minutes:
+                    stage = self._sleep_stage_name(segment.get("state"))
+                    if minutes and stage:
                         stages.append(
-                            SleepStage(
-                                stage=self._sleep_stage_name(segment.get("state")), minutes=minutes
-                            )
+                            SleepStage(stage=stage, minutes=minutes)
                         )
                 except Exception:
                     continue
+
+            awake_minutes = int(
+                payload.get("sleep_awake_duration", payload.get("awake_duration"))
+                or sum(stage.minutes for stage in stages if stage.stage == "awake")
+            )
+            sleep_fields = ("sleep_deep_duration", "sleep_light_duration", "sleep_rem_duration")
+            if any(payload.get(field) is not None for field in sleep_fields):
+                asleep_minutes = sum(int(payload.get(field) or 0) for field in sleep_fields)
+            elif any(stage.stage != "awake" for stage in stages):
+                asleep_minutes = sum(stage.minutes for stage in stages if stage.stage != "awake")
+            else:
+                # Mi Fitness schemas use both minutes and seconds for duration;
+                # compare against the session interval when stage totals are absent.
+                raw_duration = int(payload.get("duration") or duration_minutes)
+                if raw_duration > duration_minutes:
+                    raw_duration //= 60
+                asleep_minutes = (
+                    raw_duration - awake_minutes
+                    if raw_duration == duration_minutes else raw_duration
+                )
+            asleep_minutes = max(0, min(duration_minutes, asleep_minutes))
+            awake_minutes = max(0, min(duration_minutes, awake_minutes))
 
             sleep_id = f"{item.get('sid', self.user_id)}_{item.get('time', int(sleep_end))}"
             yield SleepSession(

@@ -15,11 +15,15 @@ const state = {
   syncTypes: ['daily_activity', 'heart_rate', 'sleep', 'workouts', 'body_measurements', 'spo2', 'stress', 'abnormal_heart_beat'],
   lastResponse: null,
   lastRequestInfo: null,
+  overviewRequestId: 0,
 };
 
 // DOM Utilities
 const $ = (id) => document.getElementById(id);
 const $$ = (selector) => document.querySelectorAll(selector);
+const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+}[char]));
 
 // Date Helpers
 const formatDate = (d) => {
@@ -114,8 +118,8 @@ function showToast(title, desc = '', type = 'info', duration = 3500) {
   toast.innerHTML = `
     <div class="toast-icon">${icons[type] || 'ℹ️'}</div>
     <div class="toast-content">
-      <div class="toast-title">${title}</div>
-      ${desc ? `<div class="toast-desc">${desc}</div>` : ''}
+      <div class="toast-title">${escapeHtml(title)}</div>
+      ${desc ? `<div class="toast-desc">${escapeHtml(desc)}</div>` : ''}
     </div>
   `;
 
@@ -193,9 +197,11 @@ async function api(method, path, body = null) {
 
     if (!resp.ok) {
       showToast(`请求失败: HTTP ${resp.status}`, jsonObj?.error || jsonObj?.detail || '请查看控制台输出', 'error');
+      return null;
     }
 
-    return jsonObj;
+    // Keep the full response in the inspector; renderers consume the query rows.
+    return Array.isArray(jsonObj?.data) ? jsonObj.data : jsonObj;
   } catch (err) {
     const latency = Math.round(performance.now() - startTime);
     updateInspectorHeader(method, path, 'err', '网络错误', latency);
@@ -311,44 +317,65 @@ function downloadJson() {
 
 // Overview Dashboard Loader
 async function loadOverview() {
+  const requestId = ++state.overviewRequestId;
+  const startDate = getSd();
+  const endDate = getEd();
+  const rangeQuery = (path) => `${path}?start_date=${startDate}&end_date=${endDate}`;
   showToast('正在加载仪表盘概览…', '', 'info', 1500);
-  const summaryPromise = api('GET', getRangeQuery('/api/summary'));
-  const hrPromise = api('GET', getRangeQuery('/api/heart-rate') + '&sample_type=resting&limit=1');
-  const sleepPromise = api('GET', getRangeQuery('/api/sleep') + '&include_naps=true');
-  const spo2Promise = api('GET', getRangeQuery('/api/spo2') + '&limit=1');
-  const stressPromise = api('GET', getRangeQuery('/api/stress') + '&limit=1');
+  $('overviewRangeStatus').textContent = `正在查询 ${startDate} 至 ${endDate} 的本地记录…`;
+  ['statSteps', 'statCalories', 'statDistance', 'statHr', 'statSleep', 'statSpo2', 'statStress']
+    .forEach(id => { $(id).textContent = '--'; });
+  const summaryPromise = api('GET', rangeQuery('/api/summary'));
+  const hrPromise = api('GET', rangeQuery('/api/heart-rate') + '&sample_type=resting');
+  const sleepPromise = api('GET', rangeQuery('/api/sleep') + '&include_naps=true');
+  const spo2Promise = api('GET', rangeQuery('/api/spo2'));
+  const stressPromise = api('GET', rangeQuery('/api/stress'));
 
   const [summary, hr, sleep, spo2, stress] = await Promise.all([
     summaryPromise, hrPromise, sleepPromise, spo2Promise, stressPromise
   ]);
+  // A slow initial request must not overwrite a later date-range refresh.
+  if (requestId !== state.overviewRequestId) return;
 
   if (summary && Array.isArray(summary) && summary.length > 0) {
     const latest = summary[summary.length - 1];
+    $('overviewRangeStatus').textContent =
+      `${startDate} 至 ${endDate}：已有 ${summary.length} 天活动记录；概览显示最新一天（${latest.date}），历史明细见「每日活动」`;
     $('statSteps').textContent = latest.steps ? latest.steps.toLocaleString() : '0';
-    $('statCalories').textContent = latest.active_calories ? Math.round(latest.active_calories) : '0';
-    $('statDistance').textContent = latest.distance ? (latest.distance / 1000).toFixed(2) : '0';
+    $('statCalories').textContent = Math.round(latest.active_kcal ?? 0);
+    $('statDistance').textContent = ((latest.distance_m ?? 0) / 1000).toFixed(2);
+  } else {
+    $('overviewRangeStatus').textContent = `${startDate} 至 ${endDate}：暂无活动记录，请同步所选日期范围`;
   }
 
   if (hr && Array.isArray(hr) && hr.length > 0) {
-    $('statHr').textContent = hr[0].bpm || '--';
+    $('statHr').textContent = hr[hr.length - 1].bpm ?? '--';
   }
 
   if (sleep && Array.isArray(sleep) && sleep.length > 0) {
     const lastSleep = sleep[sleep.length - 1];
-    const totalMinutes = lastSleep.duration_minutes || (lastSleep.end_time - lastSleep.start_time) / 60;
+    const totalMinutes = lastSleep.time_asleep_minutes;
     const hours = (totalMinutes / 60).toFixed(1);
     $('statSleep').textContent = isNaN(hours) ? '--' : hours;
   }
 
   if (spo2 && Array.isArray(spo2) && spo2.length > 0) {
-    $('statSpo2').textContent = spo2[0].spo2_value ? `${spo2[0].spo2_value}%` : '--';
+    const latestSpo2 = spo2[spo2.length - 1].spo2_pct;
+    $('statSpo2').textContent = latestSpo2 != null ? `${latestSpo2}%` : '--';
   }
 
   if (stress && Array.isArray(stress) && stress.length > 0) {
-    $('statStress').textContent = stress[0].stress_value || '--';
+    $('statStress').textContent = stress[stress.length - 1].stress_score ?? '--';
   }
 
-  showToast('仪表盘已刷新', '最新数据已加载', 'success');
+  const responses = [summary, hr, sleep, spo2, stress];
+  if (responses.some(data => data === null)) {
+    showToast('部分数据加载失败', '请查看控制台中的错误响应', 'warning');
+  } else if (responses.some(data => Array.isArray(data) && data.length > 0)) {
+    showToast('仪表盘已刷新', '本地数据已加载', 'success');
+  } else {
+    showToast('所选日期暂无本地数据', '请先同步该日期范围，或调整查询日期', 'info');
+  }
 }
 
 // Health Data Queries
@@ -380,12 +407,12 @@ function renderSummaryVisual(data) {
   `;
 
   data.forEach(item => {
-    const distKm = item.distance ? (item.distance / 1000).toFixed(2) : '0.00';
+    const distKm = ((item.distance_m ?? 0) / 1000).toFixed(2);
     html += `
       <tr>
         <td><strong>${item.date || '--'}</strong></td>
         <td><span class="badge badge-success">👟 ${(item.steps || 0).toLocaleString()} 步</span></td>
-        <td>🔥 ${Math.round(item.active_calories || 0)} kcal</td>
+        <td>🔥 ${Math.round(item.active_kcal ?? 0)} kcal</td>
         <td>📍 ${distKm} km</td>
       </tr>
     `;
@@ -415,10 +442,13 @@ function renderSleepTimeline(data) {
   }
 
   const latest = data[data.length - 1];
-  const deep = latest.deep_sleep_minutes || 0;
-  const light = latest.light_sleep_minutes || 0;
-  const rem = latest.rem_sleep_minutes || 0;
-  const awake = latest.awake_minutes || 0;
+  const stageMinutes = (stage) => (latest.stages || [])
+    .filter(item => item.stage === stage)
+    .reduce((minutes, item) => minutes + item.minutes, 0);
+  const deep = stageMinutes('deep');
+  const light = stageMinutes('light');
+  const rem = stageMinutes('rem');
+  const awake = stageMinutes('awake') || latest.time_awake_minutes || 0;
   const total = deep + light + rem + awake || 1;
 
   container.innerHTML = `
@@ -564,7 +594,19 @@ async function triggerSync(background = false) {
     $('syncIdInput').value = res.sync_id;
     showToast('已获取同步任务 ID', res.sync_id, 'success');
   } else if (!background && res) {
-    showToast('前台同步完成', '健康数据已更新至本地 SQLite', 'success');
+    showSyncResult(res);
+    if (res.status === 'ok' || res.status === 'partial') await loadOverview();
+  }
+}
+
+function showSyncResult(result) {
+  const counts = `新增 ${result.records_added ?? 0} 条，更新 ${result.records_updated ?? 0} 条`;
+  if (result.status === 'ok') {
+    showToast('同步完成', counts, 'success');
+  } else if (result.status === 'partial') {
+    showToast('部分数据同步成功', `${counts}；请查看控制台中的失败类型`, 'warning');
+  } else if (result.status === 'error' || result.status === 'cancelled') {
+    showToast('同步未完成', result.error || '请查看控制台中的错误详情', 'error');
   }
 }
 
@@ -574,7 +616,11 @@ async function pollSyncStatus() {
     showToast('请输入同步任务 ID', '', 'warning');
     return;
   }
-  await api('GET', `/api/sync/${encodeURIComponent(syncId)}`);
+  const result = await api('GET', `/api/sync/${encodeURIComponent(syncId)}`);
+  if (result) {
+    showSyncResult(result);
+    if (result.status === 'ok' || result.status === 'partial') await loadOverview();
+  }
 }
 
 // QR Code Authentication Modal & Auto Polling
@@ -643,6 +689,7 @@ function startQrPolling() {
         stopQrFlow();
         $('qrStatusText').innerHTML = `✅ <strong>登录成功！</strong> API Key 已自动保存`;
         saveApiKey(data.api_key);
+        loadOverview();
         showToast('扫码授权成功', `API Key: ${data.api_key.slice(0, 16)}…`, 'success');
         setTimeout(() => closeQrModal(), 1800);
       }
@@ -736,14 +783,15 @@ function renderKeysTable(data) {
   `;
 
   data.forEach(k => {
+    const prefix = k.key_masked?.split('…')[0] || k.prefix || k.api_key_prefix || '';
     html += `
       <tr>
-        <td><strong>${k.label || '默认'}</strong></td>
-        <td><code>${k.prefix || k.api_key_prefix || 'mif_sk_...'}</code></td>
-        <td>${k.user_id || '--'}</td>
-        <td>${k.created_at || '--'}</td>
+        <td><strong>${escapeHtml(k.label || '默认')}</strong></td>
+        <td><code>${escapeHtml(k.key_masked || prefix || 'mif_sk_...')}</code></td>
+        <td>${escapeHtml(k.user_id || '--')}</td>
+        <td>${escapeHtml(k.created_at || '--')}</td>
         <td>
-          <button class="btn btn-danger btn-sm" onclick="revokeKeyByPrefix('${k.prefix || k.api_key_prefix}')">吊销</button>
+          <button class="btn btn-danger btn-sm" data-key-prefix="${escapeHtml(prefix)}" onclick="revokeKeyByPrefix(this.dataset.keyPrefix)">吊销</button>
         </td>
       </tr>
     `;
