@@ -7,7 +7,7 @@ Thanks for contributing.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e '.[dev]'
+pip install -e '.[all,dev]'
 ```
 
 ## Before opening a change
@@ -21,5 +21,6 @@ pip install -e '.[dev]'
 ```bash
 ruff check src tests
 pytest
+node --test tests/test_dashboard.cjs
 python -m build
 ```

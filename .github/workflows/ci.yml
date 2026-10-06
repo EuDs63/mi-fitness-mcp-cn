@@ -25,6 +25,8 @@ jobs:
       - name: Pytest
         run: |
           pytest -q
+      - name: Dashboard regression tests
+        run: node --test tests/test_dashboard.cjs
       - name: Build
         run: |
           python -m build

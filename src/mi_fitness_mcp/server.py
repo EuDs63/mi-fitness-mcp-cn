@@ -3,16 +3,17 @@
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, TextContent, Tool, ToolAnnotations
 
 from mi_fitness_mcp.adapters.mi_fitness_cloud import MiFitnessCloudAdapter
-from mi_fitness_mcp.auth import load_mi_fitness_token
+from mi_fitness_mcp.auth import resolve_mcp_credentials
 from mi_fitness_mcp.config import load_config
 from mi_fitness_mcp.models import ConnectionStatus, QueryResponse
 from mi_fitness_mcp.services.query_service import QueryService
@@ -28,6 +29,7 @@ db = None
 adapter = None
 sync_service = None
 query_service = None
+credentials_error: str | None = None
 sync_tasks: dict[str, dict[str, Any]] = {}
 sync_active = False
 MAX_SYNC_TASKS = 100
@@ -46,7 +48,7 @@ def _prune_sync_tasks() -> None:
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    tools = [
         Tool(
             name="get_connection_status",
             description="Check connection status",
@@ -232,11 +234,36 @@ async def list_tools() -> list[Tool]:
                 "properties": {"data_types": {"type": "array", "items": {"type": "string"}}},
             },
         ),
+        Tool(
+            name="get_analysis_snapshot",
+            description=(
+                "Get a compact offline health dataset for analysis: daily activity, sleep sessions, "
+                "workouts, daily resting heart rate/SpO2/stress statistics, units and data quality notes. "
+                "Check coverage before inferring trends; supports at most 93 days per request."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "start_date": {"type": "string", "format": "date"},
+                    "end_date": {"type": "string", "format": "date"},
+                },
+                "required": ["start_date", "end_date"],
+            },
+        ),
     ]
+    for tool in tools:
+        writes_data = tool.name == "sync_data"
+        tool.annotations = ToolAnnotations(
+            readOnlyHint=not writes_data,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=writes_data or tool.name == "get_connection_status",
+        )
+    return tools
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
     try:
         if name == "get_connection_status":
             result = await _handle_get_connection_status()
@@ -266,19 +293,42 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             result = await _handle_query_abnormal_heart_beat(arguments)
         elif name == "get_data_coverage":
             result = await _handle_get_data_coverage(arguments)
+        elif name == "get_analysis_snapshot":
+            if not query_service:
+                result = {"status": "error", "error": "Query service not initialized"}
+            else:
+                result = QueryResponse(
+                    status="ok",
+                    source="cache",
+                    data=query_service.get_analysis_snapshot(
+                        arguments["start_date"], arguments["end_date"]
+                    ),
+                ).model_dump()
         else:
             result = {"status": "error", "error": f"Unknown tool: {name}"}
-        return [TextContent(type="text", text=json.dumps(result, default=str))]
+        encoded = json.dumps(result, default=str)
+        return CallToolResult(
+            content=[TextContent(type="text", text=encoded)],
+            structuredContent=json.loads(encoded),
+            isError=result.get("status") == "error",
+        )
     except Exception as e:
         logger.exception("Mi Fitness tool error")
-        return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(e)}))]
+        result = {"status": "error", "error": str(e)}
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(result))],
+            structuredContent=result,
+            isError=True,
+        )
 
 
 async def _handle_get_connection_status() -> dict:
     global adapter, config
-    if not config or config.mode == "not_configured":
+    if not config or adapter is None:
         return ConnectionStatus(
-            mode="not_configured", connected=False, message="Server not configured."
+            mode="not_configured",
+            connected=False,
+            message=credentials_error or "Sign in through the Web UI, then restart the MCP server.",
         ).model_dump()
 
     connected = False
@@ -334,9 +384,7 @@ async def _handle_get_connection_status() -> dict:
 async def _background_sync(sync_id: str, arguments: dict) -> None:
     global sync_active
     try:
-        sync_tasks[sync_id].update(
-            status="running", started_at=datetime.now(UTC).isoformat()
-        )
+        sync_tasks[sync_id].update(status="running", started_at=datetime.now(UTC).isoformat())
         sync_tasks[sync_id] = await _run_sync_data(arguments, sync_id)
     except asyncio.CancelledError:
         sync_tasks[sync_id] = {"sync_id": sync_id, "status": "cancelled"}
@@ -619,28 +667,37 @@ async def _handle_get_data_coverage(arguments: dict) -> dict:
     return QueryResponse(status="ok", source="cache", data={"coverage": coverage}).model_dump()
 
 
-async def main():
-    global config, db, adapter, sync_service, query_service
+def _initialize_services() -> None:
+    global config, db, adapter, sync_service, query_service, credentials_error
     config = load_config()
     db = Database(config.database_path)
-    if config.mode == "mi_fitness_cloud":
-        user_id, pass_token = load_mi_fitness_token()
-        if user_id and pass_token:
-            adapter = MiFitnessCloudAdapter(
-                user_id=user_id, pass_token=pass_token, region=config.region
-            )
-            adapter.http_timeout = config.http_timeout_seconds
-            adapter.request_retries = config.request_retries
-            adapter.max_pages = config.max_pages
-            # Do not connect here: MCP stdio must become available even when Xiaomi
-            # authentication or networking is slow. Status/sync tools connect on demand.
+    adapter = None
+    sync_service = None
+    credentials_error = None
+    try:
+        credentials = resolve_mcp_credentials(config, db, os.environ.get("MI_FITNESS_API_KEY"))
+    except ValueError as exc:
+        credentials = None
+        credentials_error = str(exc)
+    if credentials:
+        user_id, pass_token, region = credentials
+        config = config.model_copy(update={"mode": "mi_fitness_cloud", "region": region})
+        adapter = MiFitnessCloudAdapter(user_id=user_id, pass_token=pass_token, region=region)
+        adapter.http_timeout = config.http_timeout_seconds
+        adapter.request_retries = config.request_retries
+        adapter.max_pages = config.max_pages
+        # Cached queries work offline. Only status/sync connects to Xiaomi.
     if adapter:
         sync_service = SyncService(
             adapter, db, config.default_lookback_days, config.sync_chunk_days
         )
         query_service = QueryService(db, adapter.get_user_id() or "unknown")
     else:
-        query_service = QueryService(db, "unknown")
+        query_service = None
+
+
+async def main():
+    _initialize_services()
     try:
         async with stdio_server() as (read_stream, write_stream):
             await app.run(read_stream, write_stream, app.create_initialization_options())

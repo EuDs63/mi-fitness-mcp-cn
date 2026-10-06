@@ -1,5 +1,6 @@
 """Query service for retrieving data from database."""
 
+from collections import defaultdict
 from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import Any
@@ -364,3 +365,77 @@ class QueryService:
             coverage = [c for c in coverage if c["data_type"] in data_types]
 
         return coverage
+
+    def get_analysis_snapshot(self, start_date: str, end_date: str) -> dict[str, Any]:
+        """Return a bounded, compact dataset without changing or synchronizing records."""
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+        if not 0 <= (end - start).days < 93:
+            raise ValueError("Select a date range of 1 to 93 days.")
+
+        def daily_stats(samples: list[dict], field: str) -> list[dict]:
+            days: dict[str, list[float]] = defaultdict(list)
+            for sample in samples:
+                days[sample["timestamp"][:10]].append(sample[field])
+            return [
+                {
+                    "date": date,
+                    "sample_count": len(values),
+                    "min": min(values),
+                    "max": max(values),
+                    "mean": round(sum(values) / len(values), 2),
+                }
+                for date, values in sorted(days.items())
+            ]
+
+        sleeps = []
+        for session in self.get_sleep_sessions(start_date, end_date):
+            stage_minutes: dict[str, int] = defaultdict(int)
+            for stage in session.get("stages", []):
+                stage_minutes[stage["stage"]] += stage["minutes"]
+            sleeps.append(
+                {
+                    "date": session["end_at"][:10],
+                    **{
+                        key: value
+                        for key, value in session.items()
+                        if key not in {"sleep_id", "stages"}
+                    },
+                    "stage_minutes": dict(stage_minutes),
+                }
+            )
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "units": {
+                "steps": "steps",
+                "distance_m": "m",
+                "active_kcal": "kcal",
+                "sleep_duration": "minutes",
+                "heart_rate": "bpm",
+                "spo2": "%",
+                "stress": "0-100",
+            },
+            "daily_activity": [
+                {
+                    field: row[field]
+                    for field in ("date", "steps", "distance_m", "active_kcal", "active_minutes")
+                }
+                for row in self.get_daily_summaries(start_date, end_date)
+            ],
+            "sleep_sessions": sleeps,
+            "workouts": self.get_workouts(start_date, end_date),
+            "resting_heart_rate": daily_stats(
+                self.get_heart_rate_samples(start_date, end_date, sample_type="resting"), "bpm"
+            ),
+            "spo2": daily_stats(self.get_spo2_samples(start_date, end_date), "spo2_pct"),
+            "stress": daily_stats(self.get_stress_samples(start_date, end_date), "stress_score"),
+            "coverage": self.get_data_coverage(),
+            "coverage_scope": "all_cached_dates",
+            "data_quality_notes": [
+                "Missing dates or samples indicate unavailable records, not zero activity or normal health.",
+                "Sleep sessions may overlap across sources; summing their durations can overcount sleep.",
+                "Distance uses deduplicated minute records and may differ from the App's merged total.",
+                "Sample counts describe exported records, not continuous monitoring coverage.",
+            ],
+        }

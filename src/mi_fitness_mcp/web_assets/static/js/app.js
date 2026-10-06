@@ -35,33 +35,47 @@ const formatDate = (d) => {
 
 function initDates() {
   const today = new Date();
-  const yesterday = new Date(Date.now() - 86400000);
-  
-  $('startDate').value = formatDate(yesterday);
-  $('endDate').value = formatDate(today);
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const savedStart = localStorage.getItem('mi_fitness_start_date');
+  const savedEnd = localStorage.getItem('mi_fitness_end_date');
+  const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value || '');
+  if (validDate(savedStart) && validDate(savedEnd) && savedStart <= savedEnd) {
+    $('startDate').value = savedStart;
+    $('endDate').value = savedEnd;
+    $$('.preset-pill').forEach(p => p.classList.remove('active'));
+  } else {
+    $('startDate').value = formatDate(yesterday);
+    $('endDate').value = formatDate(today);
+  }
+}
+
+function saveDateRange() {
+  localStorage.setItem('mi_fitness_start_date', getSd());
+  localStorage.setItem('mi_fitness_end_date', getEd());
 }
 
 function setDatePreset(type) {
   const today = new Date();
-  let start = new Date();
+  let start = new Date(today);
   
   $$('.preset-pill').forEach(p => p.classList.remove('active'));
   
   if (type === 'today') {
     start = today;
   } else if (type === 'yesterday') {
-    start = new Date(Date.now() - 86400000);
-    today.setDate(today.getDate() - 1);
+    start.setDate(today.getDate() - 1);
   } else if (type === '7d') {
-    start = new Date(Date.now() - 7 * 86400000);
+    start.setDate(today.getDate() - 6);
   } else if (type === '30d') {
-    start = new Date(Date.now() - 30 * 86400000);
+    start.setDate(today.getDate() - 29);
   } else if (type === 'month') {
     start = new Date(today.getFullYear(), today.getMonth(), 1);
   }
   
   $('startDate').value = formatDate(start);
-  $('endDate').value = formatDate(type === 'yesterday' ? start : new Date());
+  $('endDate').value = formatDate(today);
+  saveDateRange();
   
   const el = $(`preset-${type}`);
   if (el) el.classList.add('active');
@@ -842,6 +856,12 @@ document.addEventListener('DOMContentLoaded', () => {
   initDates();
   initApiKeyInput();
   renderSyncPills();
+  ['startDate', 'endDate'].forEach(id => {
+    $(id).addEventListener('change', () => {
+      $$('.preset-pill').forEach(p => p.classList.remove('active'));
+      saveDateRange();
+    });
+  });
   checkSystemHealth();
   setInterval(checkSystemHealth, 15000);
 

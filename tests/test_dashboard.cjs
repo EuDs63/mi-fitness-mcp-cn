@@ -6,17 +6,18 @@ const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/mi_fitness_mcp/web_assets/static/js/app.js'), 'utf8');
 
-function dashboard(responses) {
+function dashboard(responses, saved = {}) {
   const elements = new Map();
   const toasts = [];
   const requested = [];
+  const storage = new Map(Object.entries(saved));
   const getElement = (id) => {
-    if (!elements.has(id)) elements.set(id, { value: '2026-10-06', textContent: '--', innerHTML: '', className: '' });
+    if (!elements.has(id)) elements.set(id, { value: '2026-10-06', textContent: '--', innerHTML: '', className: '', classList:{add(){},remove(){}} });
     return elements.get(id);
   };
   const context = vm.createContext({
     document: { getElementById: getElement, querySelectorAll: () => [], addEventListener() {} },
-    localStorage: { getItem: () => '', setItem() {} },
+    localStorage: { getItem: key => storage.get(key) || '', setItem: (key,value) => storage.set(key,value) },
     performance: { now: () => 1 },
     setTimeout() {}, clearInterval() {}, setInterval() {},
     toasts,
@@ -86,6 +87,23 @@ test('a slow previous request cannot overwrite a refreshed date range', async ()
   await oldLoad;
   assert.equal(d.getElement('statSteps').textContent, '9,907');
   assert.match(d.getElement('overviewRangeStatus').textContent, /^2026-09-06 至 2026-10-06/);
+});
+
+test('date shortcuts select inclusive 7-day and 30-day ranges', () => {
+  const d = dashboard(queryResponses);
+  for (const [preset, days] of [['7d',7],['30d',30],['yesterday',2]]) {
+    d.run(`setDatePreset('${preset}')`);
+    const start = Date.parse(d.getElement('startDate').value);
+    const end = Date.parse(d.getElement('endDate').value);
+    assert.equal((end-start)/86400000 + 1, days);
+  }
+});
+
+test('reloading preserves a selected history range', () => {
+  const d = dashboard(queryResponses, {'mi_fitness_start_date':'2026-09-06','mi_fitness_end_date':'2026-10-06'});
+  d.run('initDates()');
+  assert.equal(d.getElement('startDate').value, '2026-09-06');
+  assert.equal(d.getElement('endDate').value, '2026-10-06');
 });
 
 test('activity and sleep views render query rows and sleep stages', async () => {

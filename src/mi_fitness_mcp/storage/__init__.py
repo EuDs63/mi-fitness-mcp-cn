@@ -781,9 +781,9 @@ class Database:
             row = conn.execute(
                 """
                 SELECT
-                    MIN(substr(start_at, 1, 10)) as first_date,
-                    MAX(substr(start_at, 1, 10)) as last_date,
-                    COUNT(DISTINCT substr(start_at, 1, 10)) as days_with_data
+                    MIN(substr(end_at, 1, 10)) as first_date,
+                    MAX(substr(end_at, 1, 10)) as last_date,
+                    COUNT(DISTINCT substr(end_at, 1, 10)) as days_with_data
                 FROM sleep_sessions
                 WHERE user_id = ?
                 """,
@@ -864,9 +864,9 @@ class Database:
                 row = conn.execute(
                     f"""
                     SELECT
-                        MIN(date({date_expr})) as first_date,
-                        MAX(date({date_expr})) as last_date,
-                        COUNT(DISTINCT date({date_expr})) as days_with_data
+                        MIN(substr({date_expr}, 1, 10)) as first_date,
+                        MAX(substr({date_expr}, 1, 10)) as last_date,
+                        COUNT(DISTINCT substr({date_expr}, 1, 10)) as days_with_data
                     FROM {table_name}
                     WHERE user_id = ?
                     """,

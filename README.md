@@ -1,11 +1,11 @@
 # Mi Fitness MCP CN
 
-[![CI](https://github.com/HUAYUE1024/mi-fitness-mcp-cn/actions/workflows/ci.yml/badge.svg)](https://github.com/HUAYUE1024/mi-fitness-mcp-cn/actions/workflows/ci.yml)
+[![CI](https://github.com/EuDs63/mi-fitness-mcp-cn/actions/workflows/ci.yml/badge.svg)](https://github.com/EuDs63/mi-fitness-mcp-cn/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0-orange.svg)](CHANGELOG.md)
 
-小米运动健康（Mi Fitness）数据的**本地一站式解决方案**：MCP Server + REST API + 可视化 Web 仪表盘。把你自己账号里的健康数据同步到本地 SQLite，供 AI 客户端、其他程序或浏览器直接查询分析。
+小米运动健康（Mi Fitness）数据的**本地 MCP 数据服务**。把你自己账号里的健康数据同步到本地 SQLite，供 AI 客户端查询、分析运动和睡眠规律。REST API 与 Web 页面用于登录、同步和排错。
 
 > Local-first Mi Fitness (Xiaomi health) data hub: sync your own health data to a local SQLite database, exposed via MCP, REST API, and a web dashboard.
 
@@ -32,7 +32,7 @@ flowchart LR
     B -->|同步| C[小米健康云]
     C -->|RC4 加密 + 签名<br/>逆向协议| D[SyncService<br/>分块/增量]
     D --> E[(本地 SQLite)]
-    E --> F[MCP Server<br/>stdio · 14 个工具]
+    E --> F[MCP Server<br/>stdio · 15 个工具]
     E --> G[REST API<br/>FastAPI · X-API-Key]
     E --> H[Web 仪表盘<br/>Flask · 浏览器]
     G <--> H
@@ -56,7 +56,7 @@ flowchart LR
 ### 安装
 
 ```bash
-git clone https://github.com/HUAYUE1024/mi-fitness-mcp-cn.git
+git clone https://github.com/EuDs63/mi-fitness-mcp-cn.git
 cd mi-fitness-mcp-cn
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
@@ -75,6 +75,10 @@ mi-fitness-mcp web    # 终端 2：Web 仪表盘 (127.0.0.1:8322)
 ```
 
 浏览器打开 `http://127.0.0.1:8322/` → 点击「扫码登录」→ 用小米账号 / 米家 App 扫码确认 → 自动换取并注入 API Key。
+
+先同步需要的日期范围，再启动或重启 MCP。若本地有效的 Web 登录都属于同一个小米账号，MCP 会直接复用它，从系统 keyring 读取凭据，无需再抓 Cookie 或把 passToken 写入客户端配置。已同步的记录可以离线查询，只有连接检查和同步才访问小米云。
+
+若本地存在多个账号，MCP 不会自动选择；可通过 `MI_FITNESS_API_KEY` 环境变量指定一个有效的已发放 Key。已有手动 `setup` 配置会优先使用，显式指定的 Key 优先级最高。
 
 **方式 B：手动配置凭据**
 
@@ -103,7 +107,21 @@ mi-fitness-mcp sync                                                            #
 }
 ```
 
-MCP 工具（14 个）：`get_connection_status` · `sync_data` · `get_sync_status` · `get_profile` · `get_daily_summary` · `query_metric_series` · `query_heart_rate` · `query_body_measurements` · `query_sleep` · `query_workouts` · `query_spo2` · `query_stress` · `query_abnormal_heart_beat` · `get_data_coverage`
+MCP 工具（15 个）：`get_connection_status` · `sync_data` · `get_sync_status` · `get_profile` · `get_daily_summary` · `query_metric_series` · `query_heart_rate` · `query_body_measurements` · `query_sleep` · `query_workouts` · `query_spo2` · `query_stress` · `query_abnormal_heart_beat` · `get_data_coverage` · `get_analysis_snapshot`
+
+### 在 Codex 中分析数据
+
+安装后可运行：
+
+```bash
+codex mcp add mi-fitness -- mi-fitness-mcp serve
+```
+
+也可在 Codex 设置中的 MCP 服务器页面添加 STDIO 服务，命令为 `mi-fitness-mcp`，参数为 `serve`，保存并重启服务。参见 [OpenAI MCP 配置文档](https://learn.chatgpt.com/docs/extend/mcp)。
+
+分析时先调用 `get_data_coverage`，再调用 `get_analysis_snapshot(start_date, end_date)`。快照最多包含 93 天的日活动、睡眠和运动记录，以及按日汇总的静息心率、血氧、压力统计，附带单位和数据质量说明。需要某项原始明细时，再调用对应的查询工具。首次回填较长日期范围建议使用 `sync_data(background=true)`，并用 `get_sync_status` 查询结果。
+
+数据解释：步数与活动热量优先采用小米云已合并的每日汇总，避免重复累加手机和穿戴设备。距离来自去重的分钟明细，可能与 App 的汇总不同。睡眠按本地起床日期归属，`duration_minutes` 含清醒时间，`time_asleep_minutes` 是实际睡眠时长；同一晚可能存在多个重叠来源，不能直接把所有记录相加。缺失日期不会填成零。分析建议应结合用户目标和自述，并说明数据覆盖的限制。
 
 ## REST API 与鉴权
 
@@ -152,7 +170,7 @@ passToken 是长期凭据，但退出登录、修改密码或在小米账号安�
 <details>
 <summary><b>启动报错 `'Server' object has no attribute 'list_tools'`？</b></summary>
 
-MCP SDK 2.x 移除了该 API。本项目已固定 `mcp>=1.0.0,<2`，若你从旧版本升级，重新 `pip install -e .` 让依赖约束生效即可。
+本 fork 使用 MCP SDK 1.30 的工具注解和结构化返回格式，依赖范围为 `mcp>=1.30.0,<2`。若你从旧版本升级，重新 `pip install -e .` 让依赖约束生效即可。
 </details>
 
 <details>
@@ -166,7 +184,7 @@ MCP SDK 2.x 移除了该 API。本项目已固定 `mcp>=1.0.0,<2`，若你从旧
 ```text
 src/mi_fitness_mcp/
 ├── main.py               # CLI 统一入口: serve / setup / doctor / sync / api / web
-├── server.py             # MCP Server（14 个工具 + 异步同步引擎）
+├── server.py             # MCP Server（15 个工具 + 异步同步引擎）
 ├── api.py                # REST API 服务（FastAPI: 数据端点 + Key 体系 + 扫码登录）
 ├── web.py                # 可视化仪表盘反向代理服务（Flask）
 ├── web_assets/           # 前端界面（HTML / CSS / JS）
@@ -193,7 +211,8 @@ tests/                    # 单元测试与端到端测试套件
 ```bash
 pip install -e '.[all,dev]'
 ruff check src tests    # 代码规范检查（CI 同款）
-pytest -v               # 完整测试套件（22 个）
+pytest -v               # Python 测试套件
+node --test tests/test_dashboard.cjs # 前端数据与日期范围回归测试
 python -m build         # 构建发行包
 ```
 
@@ -202,7 +221,7 @@ python -m build         # 构建发行包
 **数据只进不出**：本项目从小米云拉取你自己的数据到本地 SQLite，除小米官方服务器外不与任何第三方通信；无遥测/统计/崩溃上报；所有查询端点断网可用。完整审计见 [docs/PRIVACY.md](docs/PRIVACY.md)。
 
 - `passToken` 等同小米账号登录态，**切勿提交或泄露**；若泄露，请在小米账号安全中心退出设备并重新登录
-- 凭据与 API Key 密钥存于系统 keyring（Windows DPAPI / macOS Keychain / Linux Secret Service），不落明文
+- passToken 优先存于系统 keyring（Windows DPAPI / macOS Keychain / Linux Secret Service）；keyring 不可用时可能回退到数据库明文。已发放的 API Key 记录也在 SQLite 中，切勿共享整个数据库
 - 不要提交本地配置、数据库、keyring 文件（`.gitignore` 已默认排除）
 - 服务默认仅绑定 `127.0.0.1`，并已启用 CORS 本机限制与 Host 白名单（防恶意网页跨站读取 / DNS 重绑定）。向局域网/公网开放前，务必设置 `MI_FITNESS_API_KEY` 与 `MI_FITNESS_ADMIN_KEY`——健康数据是敏感信息
 - 扫码登录端点允许扫码者将其账号登录到你的服务器，务必保持管理鉴权开启
